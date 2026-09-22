@@ -27,6 +27,58 @@ COMMAND_FILE = os.path.join(PROJECT_DIR, "00-in", "00-brief", "COMMAND.md")
 
 _lock = threading.Lock()
 
+# 手机控制面板（GET / 返回，同源访问，无需跨域）
+CONTROL_PANEL_HTML = f"""<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>008 远程控制面板</title>
+<style>
+  body{{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;max-width:520px;margin:0 auto;padding:18px;background:#f5f6f8;color:#222}}
+  h1{{font-size:20px;margin:0 0 4px}} .sub{{color:#888;font-size:13px;margin-bottom:18px}}
+  label{{display:block;font-size:13px;margin:12px 0 4px;font-weight:600}}
+  input,textarea,select{{width:100%;box-sizing:border-box;padding:11px;font-size:15px;border:1px solid #ccd;border-radius:9px;background:#fff}}
+  textarea{{min-height:84px;resize:vertical}}
+  button{{width:100%;padding:14px;font-size:16px;font-weight:700;color:#fff;background:#2b7de9;border:none;border-radius:11px;margin-top:18px}}
+  button:active{{background:#1c63c0}}
+  #out{{margin-top:16px;padding:12px;background:#111;color:#0f0;font-family:monospace;font-size:12px;border-radius:9px;min-height:40px;white-space:pre-wrap;word-break:break-all}}
+</style>
+</head>
+<body>
+  <h1>008 远程控制面板</h1>
+  <div class="sub">局域网触发 · 服务端口 {PORT}</div>
+  <label>Token</label>
+  <input id="token" value="{TOKEN}">
+  <label>动作</label>
+  <select id="action">
+    <option value="append">append · 追加一行到文件</option>
+    <option value="command">command · 写 COMMAND.md（异步）</option>
+    <option value="sync">sync · 仅 git 提交推送</option>
+  </select>
+  <label>目标文件（append 用，相对项目根）</label>
+  <input id="file" value="README.md">
+  <label>内容 / 命令文本</label>
+  <textarea id="text" placeholder="例如：手机 webhook 测试 2026-09-22"></textarea>
+  <button onclick="send()">发送执行</button>
+  <div id="out">待命…</div>
+<script>
+async function send(){{
+  const out=document.getElementById('out');
+  const body={{token:token.value,action:action.value}};
+  if(action.value==='append'){{body.file=file.value;body.text=text.value;}}
+  else if(action.value==='command'){{body.cmd=text.value;}}
+  out.textContent='发送中…';
+  try{{
+    const r=await fetch('/run',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
+    const j=await r.json();
+    out.textContent=JSON.stringify(j,null,2);
+  }}catch(e){{out.textContent='请求失败：'+e;}}
+}}
+</script>
+</body>
+</html>"""
+
 
 def git(*args):
     try:
@@ -93,17 +145,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, obj):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
+    def _send_html(self, html):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     def do_GET(self):
         if self.path == "/":
-            self._send(200, {
-                "status": "ok",
-                "service": "aitools-webhook-relay",
-                "project": "008-aitools-web",
-                "time": datetime.now().isoformat(),
-            })
+            self._send_html(CONTROL_PANEL_HTML)
+        elif self.path == "/ping":
+            self._send(200, {"status": "ok", "time": datetime.now().isoformat()})
         else:
             self._send(404, {"error": "not found"})
 
