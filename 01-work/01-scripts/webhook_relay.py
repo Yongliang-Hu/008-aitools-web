@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import threading
+import urllib.parse
 from datetime import datetime
 
 # ============ 配置（使用前请改 TOKEN）============
@@ -48,36 +49,33 @@ CONTROL_PANEL_HTML = f"""<!doctype html>
 <body>
   <h1>008 远程控制面板</h1>
   <div class="sub">局域网触发 · 服务端口 {PORT}</div>
-  <label>Token</label>
-  <input id="token" value="{TOKEN}">
-  <label>动作</label>
-  <select id="action">
-    <option value="append">append · 追加一行到文件</option>
-    <option value="command">command · 写 COMMAND.md（异步）</option>
-    <option value="sync">sync · 仅 git 提交推送</option>
-  </select>
-  <label>目标文件（append 用，相对项目根）</label>
-  <input id="file" value="README.md">
-  <label>内容 / 命令文本</label>
-  <textarea id="text" placeholder="例如：手机 webhook 测试 2026-09-22"></textarea>
-  <button onclick="send()">发送执行</button>
-  <div id="out">待命…</div>
-<script>
-async function send(){{
-  const out=document.getElementById('out');
-  const body={{token:token.value,action:action.value}};
-  if(action.value==='append'){{body.file=file.value;body.text=text.value;}}
-  else if(action.value==='command'){{body.cmd=text.value;}}
-  out.textContent='发送中…';
-  try{{
-    const r=await fetch('/run',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
-    const j=await r.json();
-    out.textContent=JSON.stringify(j,null,2);
-  }}catch(e){{out.textContent='请求失败：'+e;}}
-}}
-</script>
+  <form method="POST" action="/run">
+    <label>Token</label>
+    <input name="token" value="{TOKEN}">
+    <label>动作</label>
+    <select name="action">
+      <option value="append">append · 追加一行到文件</option>
+      <option value="command">command · 写 COMMAND.md（异步）</option>
+      <option value="sync">sync · 仅 git 提交推送</option>
+    </select>
+    <label>目标文件（append 用，相对项目根）</label>
+    <input name="file" value="README.md">
+    <label>内容 / 命令文本</label>
+    <textarea name="text" placeholder="例如：手机 webhook 测试 2026-09-22"></textarea>
+    <button type="submit">发送执行</button>
+  </form>
 </body>
 </html>"""
+
+# 表单提交后的结果页（前后包住 JSON 结果）
+RESULT_HTML_PREFIX = """<!doctype html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>执行结果</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;padding:18px;background:#f5f6f8}}
+pre{{background:#111;color:#0f0;padding:12px;border-radius:9px;font-size:12px;white-space:pre-wrap;word-break:break-all}}
+a{{display:inline-block;margin-top:14px;color:#2b7de9}}</style></head><body>
+<h1>执行结果</h1><pre>"""
+RESULT_HTML_SUFFIX = """</pre><a href="/">&#8592; 返回控制面板</a> <a href="/status">查看执行状态</a></body></html>"""
 
 
 def git(*args):
@@ -141,6 +139,63 @@ def write_command(text):
     return COMMAND_FILE
 
 
+# ---- 后台执行 + 状态/日志（避免手机端等待 git 慢操作而卡死）----
+LAST = {"status": "idle", "time": None, "detail": None}
+LAST_LOCK = threading.Lock()
+REL_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webhook_relay.log")
+
+
+def log(msg):
+    line = f"[{datetime.now().isoformat()}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(REL_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def worker(action, data):
+    try:
+        with _lock:  # 串行化 git，避免并发冲突
+            log(f"worker start action={action}")
+            do_pull()
+            log("pull done")
+            res = {"action": action, "time": datetime.now().isoformat()}
+            if action == "append":
+                ok, info = append_text(
+                    data.get("file", "README.md"), data.get("text", "")
+                )
+                git_ok, git_out = (False, "") if not ok else do_commit_push(
+                    f"webhook: append to {data.get('file', 'README.md')}"
+                )
+                res.update({"ok": ok and git_ok, "target": str(info), "git": git_out})
+                log(f"append ok={ok} git_ok={git_ok}")
+            elif action == "run":
+                ok, info = run_script(data.get("script", ""))
+                res.update({"script": data.get("script"), "ok": ok, "out": info})
+                log(f"run ok={ok}")
+            elif action == "sync":
+                git_ok, git_out = do_commit_push("webhook: sync")
+                res.update({"ok": git_ok, "git": git_out})
+                log(f"sync git_ok={git_ok}")
+            else:  # command
+                info = write_command(data.get("cmd", data.get("text", "")))
+                git_ok, git_out = do_commit_push("webhook: new command")
+                res.update({"ok": git_ok, "note": "written to COMMAND.md", "git": git_out})
+                log(f"command git_ok={git_ok}")
+        with LAST_LOCK:
+            LAST.clear()
+            LAST.update({"status": "done", "time": res.get("time"), "detail": res})
+            log("worker done")
+    except Exception as e:  # noqa: BLE001
+        log(f"worker error {e!r}")
+        with LAST_LOCK:
+            LAST.clear()
+            LAST.update({"status": "error", "time": datetime.now().isoformat(),
+                         "detail": {"error": repr(e)}})
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, obj):
         self.send_response(code)
@@ -170,8 +225,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_html(CONTROL_PANEL_HTML)
         elif self.path == "/ping":
             self._send(200, {"status": "ok", "time": datetime.now().isoformat()})
+        elif self.path == "/status":
+            with LAST_LOCK:
+                self._send(200, dict(LAST))
         else:
             self._send(404, {"error": "not found"})
+
+    def _respond(self, result, is_form):
+        if is_form:
+            self._send_html(RESULT_HTML_PREFIX
+                            + json.dumps(result, ensure_ascii=False, indent=2)
+                            + RESULT_HTML_SUFFIX)
+        else:
+            self._send(200, result)
 
     def do_POST(self):
         if self.path != "/run":
@@ -180,43 +246,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
-            data = json.loads(raw.decode("utf-8"))
+            ctype = self.headers.get("Content-Type", "")
+            if "application/x-www-form-urlencoded" in ctype:
+                q = urllib.parse.parse_qs(raw.decode("utf-8"))
+                data = {k: v[0] for k, v in q.items()}
+                is_form = True
+            else:
+                data = json.loads(raw.decode("utf-8"))
+                is_form = False
         except Exception as e:  # noqa: BLE001
-            self._send(400, {"error": "bad json: " + str(e)})
+            self._send(400, {"error": "bad request: " + str(e)})
             return
 
         if data.get("token") != TOKEN:
-            self._send(401, {"error": "unauthorized"})
+            self._respond({"ok": False, "error": "unauthorized: token 不对"}, is_form)
             return
 
+        # 立即返回「已接收」，真正 git 工作在后台线程跑，避免手机端长时间等待/卡死
         action = data.get("action", "command")
-        with _lock:
-            do_pull()
-            result = {"action": action, "time": datetime.now().isoformat()}
-            if action == "append":
-                ok, info = append_text(
-                    data.get("file", "README.md"), data.get("text", "")
-                )
-                git_ok, git_out = (False, "") if not ok else do_commit_push(
-                    f"webhook: append to {data.get('file', 'README.md')}"
-                )
-                result.update({"ok": ok and git_ok, "target": str(info), "git": git_out})
-            elif action == "run":
-                ok, info = run_script(data.get("script", ""))
-                result.update({"script": data.get("script"), "ok": ok, "out": info})
-            elif action == "sync":
-                git_ok, git_out = do_commit_push("webhook: sync")
-                result.update({"ok": git_ok, "git": git_out})
-            else:  # command：异步，写 COMMAND.md 留给自动化/手动
-                info = write_command(data.get("cmd", data.get("text", "")))
-                ok = bool(info)
-                git_ok, git_out = do_commit_push("webhook: new command")
-                result.update({
-                    "ok": git_ok,
-                    "note": "written to COMMAND.md, async exec by automation/manual",
-                    "git": git_out,
-                })
-        self._send(200, result)
+        threading.Thread(target=worker, args=(action, data), daemon=True).start()
+        self._respond({
+            "ok": True, "accepted": True, "action": action,
+            "time": datetime.now().isoformat(),
+            "note": "已接收，后台执行中；结果见 /status",
+        }, is_form)
 
     def log_message(self, *args):  # 静默日志
         pass
