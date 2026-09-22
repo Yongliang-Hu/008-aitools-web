@@ -7,3 +7,5 @@ Thumbs.db
 99-tmp/
 # 日志
 *.log
+# Agent 本地状态（记忆 / 自动化轨迹），不进版本库
+.workbuddy/
