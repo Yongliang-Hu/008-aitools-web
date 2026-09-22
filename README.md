@@ -16,4 +16,5 @@ aming-spec.md 的 IO 五区命名规范。
 进入  1-work/00-src/，用浏览器打开 index.html 即可。
 Master 123
 命令通道测试 2026-09-22
+agent mail 通道测试 2026-09-22
 
